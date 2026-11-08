@@ -228,3 +228,167 @@ fn foreign_entry_with_our_name_is_replaced_but_not_uninstalled() {
     let p = plan(&fx.host, &req(&fx, &["cursor"])).unwrap();
     assert!(p.actions[0].reason.as_deref().unwrap_or_default().contains("replaced"));
 }
+
+/// #1149: the app's own config.toml, as the reporter found it after uninstall.
+const APP_CONFIG: &str = "# kept comment\nversion = 3\ndeep_mode = true\nask_before_running = true\nauto_mode = true\ntheme = \"studio-light\"\n\n[[ai.backends]]\nenabled = true\nkind = \"agent_cli\"\nmodel = \"opencode\"\nname = \"OpenCode\"\n\n[[ai.backends]]\nkind = \"agent_cli\"\nmodel = \"codex\"\nname = \"Codex\"\n";
+
+fn app_config_path(fx: &Fx) -> PathBuf {
+    fx.host.settings_path()
+}
+
+fn write_app_config(fx: &Fx, text: &str) -> PathBuf {
+    let p = app_config_path(fx);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, text).unwrap();
+    p
+}
+
+#[test]
+fn uninstall_makes_app_config_inert() {
+    let fx = fixture();
+    let p = write_app_config(&fx, APP_CONFIG);
+    let u = uninstall(&fx.host);
+    assert_eq!(u.status, "removed", "{u:?}");
+    assert_eq!(u.neutralized_config.as_deref(), Some(p.as_path()));
+    let after = read(&p);
+    assert!(after.contains("auto_mode = false") && !after.contains("auto_mode = true"), "{after}");
+    assert_eq!(after.matches("enabled = false").count(), 2, "{after}");
+    assert!(!after.contains("enabled = true"), "{after}");
+    // The real loader agrees the result is inert.
+    let s = craft_anything_engine::settings::read_settings(&after).unwrap();
+    assert!(!s.auto_mode, "{s:?}");
+    // Everything else is preserved, including the comment.
+    assert!(after.contains("# kept comment") && after.contains("deep_mode = true") && after.contains("theme = \"studio-light\""), "{after}");
+    // Idempotent: a second uninstall changes nothing.
+    let u2 = uninstall(&fx.host);
+    assert_eq!(u2.status, "nothing_to_remove", "{u2:?}");
+    assert_eq!(u2.neutralized_config, None);
+    assert_eq!(read(&p), after);
+}
+
+#[test]
+fn uninstall_leaves_already_inert_app_config_untouched() {
+    let fx = fixture();
+    let inert = APP_CONFIG.replace("auto_mode = true", "auto_mode = false").replace("enabled = true", "enabled = false");
+    let inert = inert.replacen("kind = \"agent_cli\"\nmodel = \"codex\"", "enabled = false\nkind = \"agent_cli\"\nmodel = \"codex\"", 1);
+    let p = write_app_config(&fx, &inert);
+    let u = uninstall(&fx.host);
+    assert_eq!(u.status, "nothing_to_remove", "{u:?}");
+    assert_eq!(u.neutralized_config, None);
+    assert_eq!(read(&p), inert);
+}
+
+/// Missing keys count as on (`Settings::default` turns auto mode on, and a
+/// backend without `enabled` is enabled), so uninstall writes them off.
+#[test]
+fn uninstall_writes_off_missing_auto_mode_and_enabled_keys() {
+    let fx = fixture();
+    let minimal = "version = 3\n\n[[ai.backends]]\nkind = \"agent_cli\"\nmodel = \"opencode\"\nname = \"OpenCode\"\n";
+    let p = write_app_config(&fx, minimal);
+    let u = uninstall(&fx.host);
+    assert_eq!(u.status, "removed", "{u:?}");
+    assert_eq!(u.neutralized_config.as_deref(), Some(p.as_path()));
+    let after = read(&p);
+    assert!(after.contains("auto_mode = false"), "{after}");
+    assert!(after.contains("enabled = false"), "{after}");
+    let s = craft_anything_engine::settings::read_settings(&after).unwrap();
+    assert!(!s.auto_mode, "{s:?}");
+}
+
+#[test]
+fn uninstall_leaves_malformed_app_config_alone() {
+    let fx = fixture();
+    let broken = "auto_mode = [broken\n";
+    let p = write_app_config(&fx, broken);
+    let u = uninstall(&fx.host);
+    // Still live, so the uninstall is honestly partial, not a success:
+    // exit code 1, and the note tells the user the config was left alone.
+    assert_eq!(u.status, "partial", "{u:?}");
+    assert_eq!(u.neutralized_config, None);
+    assert!(u.app_config_error.is_some(), "{u:?}");
+    assert_eq!(read(&p), broken);
+}
+
+#[test]
+fn uninstall_skips_newer_version_app_config() {
+    let fx = fixture();
+    let newer = APP_CONFIG.replace("version = 3", "version = 99");
+    let p = write_app_config(&fx, &newer);
+    let u = uninstall(&fx.host);
+    // The config is live and was skipped, so this is partial too.
+    assert_eq!(u.status, "partial", "{u:?}");
+    assert_eq!(u.neutralized_config, None);
+    assert!(u.app_config_error.is_some(), "{u:?}");
+    assert_eq!(read(&p), newer);
+}
+
+#[test]
+fn uninstall_makes_pending_sidecar_inert_too() {
+    let fx = fixture();
+    let p = write_app_config(&fx, APP_CONFIG);
+    // A busy shutdown deferred non-AI edits (auto_mode on, language changed)
+    // to the sidecar; the next load would merge them back into config.toml.
+    let pending = "version = 3\nlanguage = \"de\"\nauto_mode = true\n";
+    let pp = p.with_extension("pending.toml");
+    std::fs::write(&pp, pending).unwrap();
+    let u = uninstall(&fx.host);
+    assert_eq!(u.status, "removed", "{u:?}");
+    assert_eq!(u.neutralized_config.as_deref(), Some(p.as_path()));
+    assert_eq!(u.neutralized_pending_config.as_deref(), Some(pp.as_path()));
+    // The sidecar is inert but its unrelated edit survives.
+    let after = read(&pp);
+    assert!(after.contains("auto_mode = false") && after.contains("language = \"de\""), "{after}");
+    let s = craft_anything_engine::settings::read_settings(&after).unwrap();
+    assert!(!s.auto_mode, "{s:?}");
+}
+
+#[test]
+fn uninstall_reports_partial_when_pending_sidecar_cannot_be_made_inert() {
+    let fx = fixture();
+    let p = write_app_config(&fx, APP_CONFIG);
+    let broken = "auto_mode = [broken\n";
+    let pp = p.with_extension("pending.toml");
+    std::fs::write(&pp, broken).unwrap();
+    let u = uninstall(&fx.host);
+    // The main config is inert, but the sidecar cannot be made inert safely,
+    // so the uninstall is honestly partial, not a success.
+    assert_eq!(u.status, "partial", "{u:?}");
+    assert_eq!(u.neutralized_config.as_deref(), Some(p.as_path()));
+    assert_eq!(u.neutralized_pending_config, None);
+    assert!(u.app_config_error.as_deref().unwrap_or_default().contains("pending.toml"), "{u:?}");
+    assert_eq!(read(&pp), broken);
+}
+
+#[test]
+fn uninstall_neutralizes_config_dir_env_var_location() {
+    let fx = fixture();
+    let custom = fx.host.home.join("elsewhere");
+    std::fs::create_dir_all(&custom).unwrap();
+    let mut host = fx.host.clone();
+    host.env.insert("CRAFT_ANYTHING_CONFIG_DIR".into(), custom.display().to_string());
+    // A live config in the platform location must be left alone: the app
+    // loads the env-var location instead.
+    let platform = write_app_config(&fx, APP_CONFIG);
+    let real = custom.join("config.toml");
+    std::fs::write(&real, APP_CONFIG).unwrap();
+    let u = uninstall(&host);
+    assert_eq!(u.status, "removed", "{u:?}");
+    assert_eq!(u.neutralized_config.as_deref(), Some(real.as_path()));
+    assert!(read(&real).contains("auto_mode = false"), "{}", read(&real));
+    assert_eq!(read(&platform), APP_CONFIG);
+}
+
+#[test]
+fn uninstall_rejects_negative_version_app_config() {
+    let fx = fixture();
+    let negative = APP_CONFIG.replace("version = 3", "version = -1");
+    // The loader rejects a negative version, so uninstall must not edit a
+    // file the app cannot load.
+    assert!(craft_anything_engine::settings::read_settings(&negative).is_err());
+    let p = write_app_config(&fx, &negative);
+    let u = uninstall(&fx.host);
+    assert_eq!(u.status, "partial", "{u:?}");
+    assert_eq!(u.neutralized_config, None);
+    assert!(u.app_config_error.is_some(), "{u:?}");
+    assert_eq!(read(&p), negative);
+}
