@@ -75,6 +75,17 @@ pub trait AgentAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Refuse saved native tools that this run mode cannot use. The default allows them.
+    fn check_saved_tools(&self, _options: &BackendOptions, _allow_helpers: bool) -> Result<(), ToolError> {
+        Ok(())
+    }
+
+    /// Refuse a custom helper that would act without the approval tool. The default has none.
+    /// `project` is the folder the agent runs in; `config` says whether it runs on another computer.
+    fn check_subagent_modes(&self, _config: &BackendConfig, _options: &BackendOptions, _project: Option<&Path>) -> Result<(), ToolError> {
+        Ok(())
+    }
+
     /// Use ACP by default and refuse the per-message CLI runner. An explicit `acp = false` or
     /// an SSH host must fail rather than opening an interactive agent with no approval channel.
     fn requires_acp(&self) -> bool {
@@ -326,13 +337,35 @@ pub fn notes_hook_settings(cli: &str, dir: &std::path::Path) -> String {
     json!({"hooks": {"PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": 10}]}]}}).to_string()
 }
 
-/// Claude Code's tools that change something or reach outside, refused for a question.
+/// Claude Code's tools that change something, reach outside, or start helpers, refused for a
+/// question. `Task` is the pre-2.1.63 name of `Agent`; both are kept so older CLIs are held too.
 const CHANGING_TOOLS: &[&str] =
-    &["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "PowerShell", "WebFetch", "WebSearch", "Task", "TodoWrite", "AskUserQuestion"];
+    &["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "PowerShell", "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite", "AskUserQuestion"];
 
 /// Claude Code's tools that read files, refused outright in Clean room (#564): its defaults let it
 /// read in its own folder and refuse elsewhere only until a release or a setting changes that.
 const READING_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS", "NotebookRead"];
+
+/// The built-in tools a builder gets. `Agent` is Claude Code 2.1.63's name for the subagent tool
+/// (it was `Task`); a Deep build gets it so the builder can hand work to cheaper helpers. Spawning
+/// needs no permission; Claude Code documents that a subagent's own calls are checked against the
+/// session's permission rules. Clean room leaves it out for now (#1105).
+const BUILDER_TOOLS: &str = "Bash,PowerShell,Read,Write,Edit,MultiEdit,Glob,Grep,TodoWrite,NotebookEdit";
+const DEEP_BUILDER_TOOLS: &str = "Agent,Bash,PowerShell,Read,Write,Edit,MultiEdit,Glob,Grep,TodoWrite,NotebookEdit";
+
+/// A remote Deep build's `--tools` list without `Agent`: its custom agents are on the other
+/// computer, where the local preflight can't read their permission modes.
+pub(crate) fn without_agent_tools(args: &mut [String]) {
+    // Every `--tools`, including one a saved backend's extra arguments already carry: a single
+    // strip would leave our Agent-bearing list in the remote command.
+    for i in 0..args.len() {
+        if args[i] == "--tools"
+            && let Some(tools) = args.get_mut(i + 1)
+        {
+            *tools = tools.split(',').filter(|tool| *tool != "Agent" && *tool != "Task").collect::<Vec<_>>().join(",");
+        }
+    }
+}
 
 /// Claude Code answering a question about a build: the builder's session copied
 /// (`--fork-session`) and the copy not kept, no tool server, and only Read, Glob and Grep (none in
@@ -387,6 +420,282 @@ impl ClaudeCode {
     }
 }
 
+/// The most of an agent definition we read while checking: its YAML frontmatter is at the top.
+const AGENT_FILE_CAP: u64 = 64 * 1024;
+/// Bounds for the nonrecursive event parser: a hostile frontmatter can't recurse or flood it.
+const MAX_YAML_DEPTH: usize = 16;
+const MAX_YAML_EVENTS: usize = 4096;
+/// A custom subagent's permission modes that may apply edits without asking us. A mode this build
+/// doesn't know is left to Claude Code's own default.
+const PERMISSIVE_MODES: &[&str] = &["acceptEdits", "bypassPermissions", "auto", "plan"];
+
+/// Whether saved `--tools` values name a helper tool. Both `<--tools>` and `<--tools=...>` forms
+/// are comma lists.
+fn saved_tools_include_agents(args: &[String]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let list = if arg == "--tools" { args.next().map(String::as_str) } else { arg.strip_prefix("--tools=") };
+        if list.is_some_and(|list| {
+            list.split(',').any(|tool| {
+                let tool = tool.trim();
+                matches!(tool, "Agent" | "Task") || tool.starts_with("Agent(") || tool.starts_with("Task(")
+            })
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A relative config folder means the child's working folder, not ours: Claude Code resolves
+/// `CLAUDE_CONFIG_DIR` and a saved relative folder after changing into the project.
+fn child_path(path: Option<std::path::PathBuf>, project: Option<&Path>) -> Option<std::path::PathBuf> {
+    path.map(|path| if path.is_absolute() { path } else { project.map(|root| root.join(&path)).unwrap_or(path) })
+}
+
+/// The first custom subagent whose own permission mode would accept edits without asking the
+/// project's approval tool. Claude Code loads agents from `agents/` in its config folder,
+/// `.claude/agents/` in the managed settings directory, and `.claude/agents/` from the project up
+/// to its repository root, recursively.
+fn permissive_subagent(config_dir: Option<&std::path::Path>, project: Option<&std::path::Path>) -> Result<Option<(std::path::PathBuf, String)>, ToolError> {
+    let mut visited = std::collections::HashSet::new();
+    for dir in agent_dirs(config_dir, project) {
+        if let Some(found) = scan_agent_dir(&dir, 0, &mut visited)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+/// Claude Code's managed subagents: `.claude/agents/` inside the file-based managed settings
+/// directory. Paths per the managed-settings docs: Linux/WSL `/etc/claude-code`, macOS
+/// `/Library/Application Support/ClaudeCode`, Windows `C:\\Program Files\\ClaudeCode` (the legacy
+/// `C:\\ProgramData\\ClaudeCode` is not read).
+fn managed_agents_dir() -> std::path::PathBuf {
+    let root = if cfg!(target_os = "macos") {
+        std::path::PathBuf::from("/Library/Application Support/ClaudeCode")
+    } else if cfg!(target_os = "windows") {
+        std::path::PathBuf::from(r"C:\Program Files\ClaudeCode")
+    } else {
+        std::path::PathBuf::from("/etc/claude-code")
+    };
+    root.join(".claude").join("agents")
+}
+
+/// The user config's `agents/`, the managed settings `.claude/agents/`, the project's
+/// `.claude/agents/`, and every `.claude/agents/` between the project and its repository root,
+/// as Claude Code discovers subagents.
+fn agent_dirs(config_dir: Option<&std::path::Path>, project: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![managed_agents_dir()];
+    if let Some(dir) = config_dir {
+        dirs.push(dir.join("agents"));
+    }
+    if let Some(root) = project {
+        // Claude Code discovers from its working directory after the OS resolves it; match that
+        // rather than a lexical path that may contain `..` or a symlinked component.
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let repo = root.ancestors().find(|dir| dir.join(".git").exists());
+        let stop = repo.unwrap_or(root.as_path());
+        for dir in root.ancestors() {
+            dirs.push(dir.join(".claude").join("agents"));
+            if dir == stop {
+                break;
+            }
+        }
+    }
+    dirs
+}
+
+/// One `agents/` directory, its subfolders and their `.md` files. A file or folder that can't be
+/// read fails the check rather than hiding a permissive agent; a symlink loop is visited once.
+fn scan_agent_dir(
+    dir: &std::path::Path,
+    depth: u8,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> Result<Option<(std::path::PathBuf, String)>, ToolError> {
+    if depth > 16 {
+        return Err(ToolError::new(ErrorCode::BadSettings, format!("The custom agent folder {} is nested too deeply to check.", dir.display()))
+            .with_remediation("Flatten the agent folder or remove the nested files, then try again."));
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(agent_read_error(dir, &e)),
+    };
+    if let Ok(canonical) = std::fs::canonicalize(dir)
+        && !visited.insert(canonical)
+    {
+        return Ok(None);
+    }
+    // Scan every entry, including nested folders: skipping one would be a bypass. The check runs
+    // once per turn, so a large agents folder costs one scan, not one per draw.
+    for entry in entries {
+        let entry = entry.map_err(|e| agent_read_error(dir, &e))?;
+        let path = entry.path();
+        let meta = std::fs::metadata(&path).map_err(|e| agent_read_error(&path, &e))?;
+        if meta.is_dir() {
+            if let Some(found) = scan_agent_dir(&path, depth + 1, visited)? {
+                return Ok(Some(found));
+            }
+        } else if meta.is_file() && path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("md")) {
+            let text = read_agent_file(&path)?;
+            let modes = agent_permission_modes(&text).map_err(|why| {
+                ToolError::new(ErrorCode::BadSettings, format!("Couldn't check the custom agent {}: {why}.", path.display()))
+                    .with_remediation("Fix or remove the file, then try again.")
+            })?;
+            if let Some(mode) = modes.into_iter().find(|mode| PERMISSIVE_MODES.iter().any(|m| m.eq_ignore_ascii_case(mode))) {
+                return Ok(Some((path, mode)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The file's first [`AGENT_FILE_CAP`] bytes: enough for the frontmatter, and a huge body can't
+/// stall a build. Lossy decoding keeps a character cut at the cap from hiding the frontmatter.
+/// `metadata` follows symlinks deliberately, so a linked agent file is checked like any other.
+fn read_agent_file(path: &std::path::Path) -> Result<String, ToolError> {
+    use std::io::Read as _;
+    let meta = std::fs::metadata(path).map_err(|e| agent_read_error(path, &e))?;
+    if !meta.is_file() {
+        return Ok(String::new());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).map_err(|e| agent_read_error(path, &e))?.take(AGENT_FILE_CAP).read_to_end(&mut bytes).map_err(|e| agent_read_error(path, &e))?;
+    let text = String::from_utf8_lossy(&bytes);
+    if bytes.len() as u64 >= AGENT_FILE_CAP && !frontmatter_closed(&text) {
+        return Err(ToolError::new(
+            ErrorCode::BadSettings,
+            format!("The custom agent {} has no closing `---` for its frontmatter within the first {} KiB.", path.display(), AGENT_FILE_CAP / 1024),
+        )
+        .with_remediation("Add the closing `---` before the prompt, or remove the file, then try again."));
+    }
+    Ok(text.into_owned())
+}
+
+/// Whether the file has no frontmatter, or its opening frontmatter has a closing `---` in the
+/// bytes read.
+fn frontmatter_closed(text: &str) -> bool {
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else { return true };
+    if first.trim_start_matches('\u{feff}').trim() != "---" {
+        return true;
+    }
+    lines.any(|line| line.trim() == "---")
+}
+
+/// A custom agent file or folder that couldn't be read: fail the check rather than skip it.
+fn agent_read_error(path: &std::path::Path, e: &std::io::Error) -> ToolError {
+    ToolError::new(ErrorCode::BadSettings, format!("Couldn't check the custom agent {}: {e}.", path.display()))
+        .with_remediation("Check that the file and its folders are readable, or remove them, then try again.")
+}
+
+/// The top-level `permissionMode`/`permission-mode` values in an agent's YAML frontmatter.
+/// Uses `yaml-rust2`'s event iterator (`Parser::next_token`), not the recursive
+/// `Parser::load`/`YamlLoader`: depth and event counts are bounded, and invalid YAML, aliases or
+/// over-limit input fail closed rather than being skipped.
+fn agent_permission_modes(text: &str) -> Result<Vec<String>, String> {
+    use yaml_rust2::parser::{Event, Parser};
+    let Some(yaml) = agent_frontmatter(text) else { return Ok(Vec::new()) };
+    let mut parser = Parser::new_from_str(&yaml);
+    let (mut depth, mut events) = (0usize, 0usize);
+    let (mut expect_key, mut want_value) = (false, false);
+    let mut modes = Vec::new();
+    loop {
+        events += 1;
+        if events > MAX_YAML_EVENTS {
+            return Err("its frontmatter has too many entries to check".into());
+        }
+        let (event, _) = match parser.next_token() {
+            Ok(event) => event,
+            Err(e) => return lenient_permission_modes(&yaml).ok_or_else(|| format!("its frontmatter isn't valid YAML: {e}")),
+        };
+        match event {
+            Event::StreamStart | Event::DocumentStart | Event::DocumentEnd | Event::Nothing => {}
+            Event::StreamEnd => break,
+            Event::MappingStart(..) | Event::SequenceStart(..) => {
+                depth = depth.saturating_add(1);
+                if depth > MAX_YAML_DEPTH {
+                    return Err(format!("its frontmatter is nested more than {MAX_YAML_DEPTH} levels deep"));
+                }
+                if depth == 1 {
+                    expect_key = true;
+                }
+            }
+            Event::MappingEnd | Event::SequenceEnd => {
+                depth = depth.saturating_sub(1);
+                if depth == 1 {
+                    expect_key = true;
+                    want_value = false;
+                }
+            }
+            Event::Scalar(value, ..) => {
+                if depth == 1 {
+                    if expect_key {
+                        if value == "<<" {
+                            return Err("its frontmatter uses a YAML merge key, which this check doesn't resolve".into());
+                        }
+                        want_value = value == "permissionMode" || value == "permission-mode";
+                        expect_key = false;
+                    } else {
+                        if want_value {
+                            let value = value.trim();
+                            if !value.is_empty() {
+                                modes.push(value.to_string());
+                            }
+                            want_value = false;
+                        }
+                        expect_key = true;
+                    }
+                }
+            }
+            Event::Alias(_) => return Err("its frontmatter uses a YAML alias, which this check doesn't resolve".into()),
+        }
+    }
+    Ok(modes)
+}
+
+/// A fallback for frontmatter that isn't valid YAML: read column-0 `permissionMode` lines and
+/// keep only permissive values. `None` keeps the YAML parse error rather than silently allowing
+/// the file.
+fn lenient_permission_modes(yaml: &str) -> Option<Vec<String>> {
+    let mut modes = Vec::new();
+    for line in yaml.lines() {
+        if line.chars().next().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        for key in ["permissionMode", "permission-mode"] {
+            let Some(rest) = line.strip_prefix(key) else { continue };
+            let rest = rest.trim_start();
+            let Some(value) = rest.strip_prefix(':') else { continue };
+            let value = value.trim();
+            let value = value.split(" #").next().unwrap_or(value).trim();
+            let value = value.trim_matches(['"', '\'']).trim();
+            if !value.is_empty() && PERMISSIVE_MODES.iter().any(|m| m.eq_ignore_ascii_case(value)) {
+                modes.push(value.to_string());
+            }
+        }
+    }
+    (!modes.is_empty()).then_some(modes)
+}
+
+/// The YAML between the opening and closing `---` lines, with the same boundary rule as before.
+fn agent_frontmatter(text: &str) -> Option<String> {
+    let mut lines = text.lines();
+    if lines.next()?.trim_start_matches('\u{feff}').trim() != "---" {
+        return None;
+    }
+    let mut yaml = String::new();
+    for line in lines {
+        if line.trim() == "---" {
+            return Some(yaml);
+        }
+        yaml.push_str(line);
+        yaml.push('\n');
+    }
+    None
+}
+
 impl AgentAdapter for ClaudeCode {
     fn ids(&self) -> &'static [&'static str] {
         &["claude-code", "claude"]
@@ -404,6 +713,65 @@ impl AgentAdapter for ClaudeCode {
         cli_can_start(craft_anything_platform::self_cli_path().as_deref(), stop)
     }
 
+    /// A saved extra argument must not override the default mode or bypass permissions: the build
+    /// forces `--permission-mode default` so every prompt reaches `core_action_approve`.
+    fn check_native_options(&self, options: &BackendOptions) -> Result<(), ToolError> {
+        let ends_options = options.args.iter().any(|arg| arg == "--");
+        let denies_prompts = options.args.iter().any(|arg| arg == "--permission-prompts=none")
+            || options.args.windows(2).any(|pair| pair[0] == "--permission-prompts" && pair[1] == "none");
+        let defines_agents = options.args.iter().any(|arg| arg == "--agents" || arg.starts_with("--agents="));
+        if ends_options
+            || denies_prompts
+            || defines_agents
+            || options.args.iter().any(|arg| matches!(arg.split('=').next().unwrap_or(arg), "--permission-mode" | "--dangerously-skip-permissions"))
+        {
+            return Err(ToolError::new(
+                ErrorCode::BadSettings,
+                "Backend extra arguments must not set --permission-mode, --dangerously-skip-permissions, --permission-prompts none or --agents, or include a bare --: Claude Code builds run in --permission-mode default so actions that need a prompt reach core_action_approve, and inline agent definitions bypass the file mode check.",
+            )
+            .with_remediation("Remove that argument; put custom helpers in .claude/agents so their modes are checked, and allow what the build needs in the project's approvals instead, then try again."));
+        }
+        Ok(())
+    }
+
+    /// A local Deep build may bring its own Agent/Task; every other run must not pre-add a
+    /// helper through saved `--tools`, which would outlive the generated tool list.
+    fn check_saved_tools(&self, options: &BackendOptions, allow_helpers: bool) -> Result<(), ToolError> {
+        if allow_helpers || !saved_tools_include_agents(&options.args) {
+            return Ok(());
+        }
+        Err(ToolError::new(
+            ErrorCode::BadSettings,
+            "Backend --tools must not add Agent or Task when this run has no helper agents (a chat, question, Clean room or remote Deep build).",
+        )
+        .with_remediation("Remove Agent/Task from the saved --tools, or use a local Deep build; put custom helpers in .claude/agents, then try again."))
+    }
+
+    /// Refuse a local custom subagent whose own `permissionMode` would accept edits without
+    /// asking `core_action_approve`. A remote run's agents are on the other computer and aren't
+    /// read here.
+    fn check_subagent_modes(&self, config: &BackendConfig, options: &BackendOptions, project: Option<&Path>) -> Result<(), ToolError> {
+        if config.ssh_host.as_deref().is_some_and(|h| !h.trim().is_empty()) {
+            return Ok(());
+        }
+        if options.args.iter().any(|arg| arg == "--add-dir" || arg.starts_with("--add-dir=")) {
+            return Err(ToolError::new(
+                ErrorCode::BadSettings,
+                "Backend --add-dir is not supported for a local Deep build: Claude could load custom helper agents from those directories without checking their permissionMode.",
+            )
+            .with_remediation("Remove --add-dir, or move the helpers into .claude/agents so their modes are checked, then try again."));
+        }
+        let config_dir = child_path(options.config_dir_here().or_else(|| self.config_dir()), project);
+        let Some((path, mode)) = permissive_subagent(config_dir.as_deref(), project)? else { return Ok(()) };
+        Err(ToolError::new(
+            ErrorCode::BadSettings,
+            format!("Claude Code's custom helper agent {} sets permissionMode: {mode}, so its edits would skip this project's approvals.", path.display()),
+        )
+        .with_remediation(
+            "Change that subagent to permissionMode: default, or remove it, then try again. A default helper's edits that need a prompt go through core_action_approve; saved Claude Code allow rules and a helper's PreToolUse hook can still bypass it.",
+        ))
+    }
+
     fn model_in_use(&self, options: Option<&BackendOptions>) -> Option<String> {
         Some(options.and_then(|options| options.cli_model.clone()).unwrap_or_else(|| crate::anthropic::DEFAULT_MODEL.into()))
     }
@@ -412,6 +780,8 @@ impl AgentAdapter for ClaudeCode {
         Ok(crate::anthropic::MODELS.iter().map(|model| model.to_string()).collect())
     }
 
+    /// Builds Claude Code's headless arguments. A Deep build adds `Agent` to `--tools` so it can
+    /// start subagents (#1105); chats, questions and Clean room builds leave it out.
     fn args(&self, cx: &ArgsCx) -> Vec<String> {
         let mut a = cx.options.args.clone();
         if cx.question {
@@ -425,11 +795,24 @@ impl AgentAdapter for ClaudeCode {
         if let Some(r) = cx.resume {
             a.extend(["--resume".into(), r.to_string()]);
         }
-        let tools = if cx.builder { "Bash,PowerShell,Read,Write,Edit,MultiEdit,Glob,Grep,TodoWrite,NotebookEdit" } else { "" };
+        let tools = match (cx.builder, cx.reads_checked) {
+            (true, false) => DEEP_BUILDER_TOOLS,
+            (true, true) => BUILDER_TOOLS,
+            _ => "",
+        };
         a.extend(["--tools".into(), tools.into()]);
         if cx.builder {
+            // Manual is Claude Code's default mode; forcing it means a saved acceptEdits, auto or
+            // bypassPermissions default can't let a helper skip the approval tool.
             // Questions go through our core_person_ask tool, which the app shows as buttons.
-            a.extend(["--permission-prompt-tool".into(), format!("mcp__{MCP_NAME}__{APPROVAL_TOOL}"), "--disallowedTools".into(), "AskUserQuestion".into()]);
+            a.extend([
+                "--permission-mode".into(),
+                "default".into(),
+                "--permission-prompt-tool".into(),
+                format!("mcp__{MCP_NAME}__{APPROVAL_TOOL}"),
+                "--disallowedTools".into(),
+                "AskUserQuestion".into(),
+            ]);
         }
         if let Some(dir) = cx.mcp.notes.as_deref().filter(|_| cx.builder) {
             // After every tool call, notes the person added meanwhile reach the model as context.
@@ -947,5 +1330,22 @@ impl AgentAdapter for GeminiCli {
             _ => {}
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_agents_directory_is_scanned() {
+        let expected = if cfg!(target_os = "macos") {
+            std::path::PathBuf::from("/Library/Application Support/ClaudeCode")
+        } else if cfg!(target_os = "windows") {
+            std::path::PathBuf::from(r"C:\Program Files\ClaudeCode")
+        } else {
+            std::path::PathBuf::from("/etc/claude-code")
+        };
+        assert!(agent_dirs(None, None).contains(&expected.join(".claude").join("agents")));
     }
 }

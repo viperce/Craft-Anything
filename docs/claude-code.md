@@ -34,7 +34,58 @@ integration does, why it is shaped this way, and what remains to confirm.
   `craft.json`, the inbox, the approvals tool or that variable counts as a system change. These
   raise the bar; they aren't a wall: a builder allowed to run any command runs with the person's
   own permissions and could change those files another way, so "commands: allow" (Auto mode's
-  default) trusts the builder.
+  default) trusts the builder. A build starts Claude Code with `--permission-mode default` (listed
+  as `manual` on newer CLIs), so a saved `permissions.defaultMode` can't make the builder or a
+  default helper skip the approval tool. Saved allow rules are separate: an action they permit,
+  such as `Bash(git push *)`, is approved by Claude Code without calling
+  `core_action_approve`, so Craft Anything's project refusal can't stop it. A user-level custom
+  subagent's `PreToolUse` hook can also return allow without a saved rule, so an action the
+  project refuses can run without calling the tool. The approval tool only sees actions that
+  reach a prompt. Working-directory reads may proceed without a saved allow rule, and a Deep
+  build explicitly pre-allows `Read`, `Glob` and `Grep`; those don't need an approval prompt.
+  Backend extra arguments that set `--permission-mode`, `--dangerously-skip-permissions`,
+  `--permission-prompts none` or `--agents`, a bare `--`, or a saved `--tools` naming
+  `Agent`/`Task` when the run has no helpers (a chat, question, Clean room or remote Deep build)
+  are refused for the same reason; inline agent definitions bypass the custom-agent file check.
+- Subagents: a local Deep build gets Claude Code's `Agent` tool, so the builder can plan in one context
+  and hand mechanical work to cheaper helpers. Spawning needs no permission, so it isn't in the
+  allow list. Claude Code documents that a subagent can only use the session's own tools and that
+  its tool calls are checked against the same permission rules; a call that would prompt is put to
+  `--permission-prompt-tool`, which is our `core_action_approve` (expected, not yet checked in a
+  live subagent run). Chats, questions and Clean room builds leave `Agent` out. Claude Code before
+  2.1.63 knows the tool as `Task`; those older CLIs don't get subagents from this change. A custom
+  subagent with `permissionMode: acceptEdits`, `bypassPermissions`, `auto` or `plan` is refused
+  before a local Deep build: `acceptEdits` and `bypassPermissions` can apply edits without asking
+  us, and `auto`/`plan` with auto mode available can let a classifier approve commands, so their
+  writes may not reach `core_action_approve`. A `permissionMode: default` helper keeps the
+  approval path for actions that prompt because the build starts in default mode; a saved allow
+  rule can still bypass it. Sandbox auto-allow may let some sandboxed Bash commands run without a
+  saved rule or approval prompt even in default mode. Plugin agents can't set
+  `permissionMode` (Claude Code ignores it there), and the check runs on every turn, so an agent
+  added mid-build is caught before the next turn. The check scans `agents/` in the chosen config
+  folder, `.claude/agents/` in the managed settings directory (Linux/WSL `/etc/claude-code`,
+  macOS `/Library/Application Support/ClaudeCode`, Windows `C:\Program Files\ClaudeCode`), and
+  every project `.claude/agents/` from the project to its repository root, recursively; a file
+  or folder it can't read refuses the build rather than being skipped, including an unreadable
+  managed directory. A managed permissive helper is refused like a user or project one. A frontmatter that never
+  closes within the first 64 KiB, isn't valid YAML, uses an alias, or nests more than 16 levels is
+  refused too, rather than parsed partially, as is a top-level YAML merge key (`<<`), which this
+  check doesn't resolve. The check runs at the start of every turn; a helper file changed later
+  in that turn isn't re-read, so a live run still has to establish Claude Code's mid-session
+  reload and approval behavior. A local Deep build also refuses backend `--add-dir`, because Claude
+  could load helpers from those directories outside the scanned paths. A signed-in live check is
+  still owed for saved allow rules and subagent hooks: a project whose Craft Anything approvals
+  refuse `Bash(git push *)`, with Claude Code settings allowing it, and a builder prompt to push;
+  and a harmless `echo` the project refuses, with a user-level subagent `PreToolUse` hook that
+  allows it. The expected result for both is the command running without a `core_action_approve`
+  call; a default-mode helper with a harmless refused command where sandbox auto-allow applies
+  is also owed a signed-in check. A managed `permissionMode: plan` or `acceptEdits` helper is
+  refused by the managed path scan. An agent file reloaded mid-turn is also not re-read until
+  the next turn, and its signed-in reload/approval check is still owed. The installed CLI is not signed in
+  (`loggedIn:false`), so these checks have not been run here. A remote (SSH) Deep build
+  leaves `Agent` out deliberately: its custom agents are on the other computer and the local
+  check can't read them, so remote helper support is a scope limit until a remote scan exists;
+  the maintainers' decision is requested in #1105.
 - Questions: Claude Code's own question tool is disabled for these runs (`--disallowedTools
   AskUserQuestion`); the agent uses our `core_person_ask` tool, which shows a card with buttons.
 - Before a build starts, `claude auth status` is checked. If Claude Code isn't signed in, the run

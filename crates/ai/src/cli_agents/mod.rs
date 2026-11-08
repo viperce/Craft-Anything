@@ -245,11 +245,18 @@ pub fn cli_can_start(cli: Option<&Path>, stop: &CancelToken) -> Result<(), ToolE
 
 /// Whether a local build by `agent` can have our tool server: over ACP every agent is handed it,
 /// else its adapter says.
-pub fn check_builder_tools(adapter: &dyn AgentAdapter, agent: &str, options: &BackendOptions, stop: &CancelToken) -> Result<(), ToolError> {
+pub fn check_builder_tools(
+    adapter: &dyn AgentAdapter,
+    agent: &str,
+    options: &BackendOptions,
+    stop: &CancelToken,
+    allow_helpers: bool,
+) -> Result<(), ToolError> {
     if selected_acp_args(adapter, agent, options).is_some() {
         return cli_can_start(craft_anything_platform::self_cli_path().as_deref(), stop);
     }
     adapter.check_native_options(options)?;
+    adapter.check_saved_tools(options, allow_helpers)?;
     adapter.check_tool_server(stop)
 }
 
@@ -847,6 +854,7 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         }
     };
     let remote = spec.config.ssh_host.clone().filter(|h| !h.trim().is_empty());
+    let is_remote = remote.is_some();
     // A folder chosen for it is on the computer it runs on: on another one, it's set below.
     let mut adapter = match remote {
         None => spec.adapters.for_backend(&agent, &spec.options),
@@ -862,6 +870,18 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         return nothing_done(&name);
     }
     if let Err(e) = adapter.check_native_options(&spec.options) {
+        let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
+        return nothing_done(&name);
+    }
+    let allow_helpers = spec.builder.is_some() && !spec.question && spec.deep && !is_remote;
+    if let Err(e) = adapter.check_saved_tools(&spec.options, allow_helpers) {
+        let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
+        return nothing_done(&name);
+    }
+    if spec.builder.is_some()
+        && spec.deep
+        && let Err(e) = adapter.check_subagent_modes(&spec.config, &spec.options, spec.project.as_deref())
+    {
         let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
         return nothing_done(&name);
     }
@@ -910,7 +930,12 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         return nothing_done(&name);
     }
     let access = access_for(spec.builder.is_some(), spec.deep, spec.question);
-    let args = build_args(adapter.as_ref(), &spec.options, text, &preamble, &mcp, if adapter.resumes() { resume.as_deref() } else { None }, access);
+    let mut args = build_args(adapter.as_ref(), &spec.options, text, &preamble, &mcp, if adapter.resumes() { resume.as_deref() } else { None }, access);
+    // A remote Deep build's custom agents are on the other computer, so the local preflight can't
+    // read their permission modes: leave helper agents out rather than open an unchecked path.
+    if remote.is_some() && spec.builder.is_some() && spec.deep {
+        adapters::without_agent_tools(&mut args);
+    }
     let shown = FailureContext::new(&program, &args, text, remote.as_deref(), spec);
     // A builder turn may take hours and sit silent for long stretches: Ghidra's first look at a big
     // game, an engine build, or the person answering a question. Claude Code's own limits are
@@ -1548,6 +1573,7 @@ mod tests {
         McpCommand { command: "/opt/ca/craft-anything-cli".into(), args: vec!["mcp".into(), "--project".into(), "/p/x.cany".into()], notes: None }
     }
 
+    /// Claude Code's arguments, including the Deep/Clean-room split for subagents (#1105).
     #[test]
     fn claude_args() {
         let a = build_args(adapter_for("claude-code").as_ref(), &BackendOptions::default(), "-what?", "PRE", &mcp(), Some("sess-1"), Access::Analyse);
@@ -1558,13 +1584,24 @@ mod tests {
         assert_eq!(a[pos("--output-format") + 1], "stream-json");
         assert!(a.contains(&"--verbose".to_string()));
         assert_eq!(a[pos("--tools") + 1], "", "built-in tools are opt-in");
-        for access in [Access::Build, Access::CleanRoomBuild] {
+        let builder_tools = |access| {
             let builder = build_args(adapter_for("claude-code").as_ref(), &BackendOptions::default(), "build it", "PRE", &mcp(), None, access);
             let builder_pos = builder.iter().position(|x| x == "--tools").unwrap();
-            let tools = &builder[builder_pos + 1];
+            builder[builder_pos + 1].clone()
+        };
+        for access in [Access::Build, Access::CleanRoomBuild] {
+            let tools = builder_tools(access);
             assert!(tools.split(',').any(|tool| tool == "Bash"), "{access:?}: {tools}");
             assert!(tools.split(',').any(|tool| tool == "Write"), "{access:?}: {tools}");
+            let builder = build_args(adapter_for("claude-code").as_ref(), &BackendOptions::default(), "build it", "PRE", &mcp(), None, access);
+            assert_eq!(builder[builder.iter().position(|arg| arg == "--permission-mode").unwrap() + 1], "default", "{access:?}");
         }
+        // #1105: a Deep build can plan in one context and hand work to cheaper helpers. Clean
+        // room leaves subagents out, where reads are held to the approval tool.
+        let deep_tools = builder_tools(Access::Build);
+        assert!(deep_tools.split(',').any(|tool| tool == "Agent"), "a Deep build can start subagents: {deep_tools}");
+        let clean_tools = builder_tools(Access::CleanRoomBuild);
+        assert!(!clean_tools.split(',').any(|tool| tool == "Agent" || tool == "Task"), "a Clean room build leaves subagents out: {clean_tools}");
         assert_eq!(a[pos("--resume") + 1], "sess-1");
         assert_eq!(a[pos("--allowedTools") + 1], "mcp__craft-anything__*");
         assert_eq!(a[pos("--model") + 1], "claude-opus-5-5", "Opus 5.5 unless configured otherwise");
@@ -1784,12 +1821,15 @@ mod tests {
         assert_eq!(claude_code_failure("rate limited"), ("Claude Code stopped: rate limited".to_string(), None));
     }
 
+    /// A builder's approvals and questions come to us, and a Deep builder may start subagents (#1105).
     #[test]
     fn builder_args_route_permissions_and_questions_to_us() {
         let a = build_args(adapter_for("claude-code").as_ref(), &BackendOptions::default(), "build it", "PRE", &mcp(), None, Access::Build);
         let pos = |f: &str| a.iter().position(|x| x == f).unwrap();
+        assert_eq!(a[pos("--permission-mode") + 1], "default", "a saved permissive default mode can't reach a helper");
         assert_eq!(a[pos("--permission-prompt-tool") + 1], "mcp__craft-anything__core_action_approve");
         assert_eq!(a[pos("--disallowedTools") + 1], "AskUserQuestion");
+        assert!(a[pos("--tools") + 1].split(',').any(|tool| tool == "Agent"), "a Deep builder can start subagents");
         assert!(a[pos("--allowedTools")..].contains(&"Read".to_string()));
         assert!(!a.iter().any(|x| x == "Write" || x == "Bash"), "writes and commands always go through the approval tool");
         let analysis = build_args(adapter_for("claude-code").as_ref(), &BackendOptions::default(), "q", "PRE", &mcp(), None, Access::Analyse);
@@ -1810,15 +1850,299 @@ mod tests {
         assert!(!McpCommand::local_or_remote(true, None, Some("/p/inbox".into())).args.contains(&"--inbox".to_string()));
     }
 
+    /// A saved --tools naming a helper is valid only for a local Deep build.
+    #[test]
+    fn claude_rejects_saved_agent_tools_outside_a_local_deep_build() {
+        let adapter = adapter_for("claude-code");
+        for args in [
+            vec!["--tools".into(), "Agent".into()],
+            vec!["--tools=Read,Agent".into()],
+            vec!["--tools".into(), "Task".into()],
+            vec!["--tools=Task,Read".into()],
+            vec!["--tools".into(), "Agent(Explore)".into()],
+            vec!["--tools=Task(Plan),Read".into()],
+        ] {
+            let options = BackendOptions { args, ..Default::default() };
+            let err = adapter.check_saved_tools(&options, false).unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadSettings);
+            assert!(err.message.contains("Agent") || err.message.contains("Task"), "{}", err.message);
+        }
+        let allowed = BackendOptions { args: vec!["--tools".into(), "Agent,Read".into()], ..Default::default() };
+        assert!(adapter.check_saved_tools(&allowed, true).is_ok());
+        let plain = BackendOptions { args: vec!["--tools=Read,Glob".into()], ..Default::default() };
+        assert!(adapter.check_saved_tools(&plain, false).is_ok());
+    }
+
+    /// A saved backend argument must not override the forced default mode or bypass permissions.
+    #[test]
+    fn claude_refuses_backend_args_that_bypass_default_mode() {
+        let adapter = adapter_for("claude-code");
+        for args in [
+            vec!["--permission-mode".into(), "acceptEdits".into()],
+            vec!["--permission-mode=bypassPermissions".into()],
+            vec!["--dangerously-skip-permissions".into()],
+            vec!["--permission-prompts".into(), "none".into()],
+            vec!["--permission-prompts=none".into()],
+            vec!["--agents".into(), r#"{"helper":{"permissionMode":"acceptEdits"}}"#.into()],
+            vec![r#"--agents={"helper":{"permissionMode":"acceptEdits"}}"#.into()],
+            vec!["--".into()],
+        ] {
+            let options = BackendOptions { args, ..Default::default() };
+            let err = adapter.check_native_options(&options).unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadSettings);
+            assert!(
+                err.message.contains("--permission-mode") && err.message.contains("--dangerously-skip-permissions") && err.message.contains("--agents"),
+                "{}",
+                err.message
+            );
+        }
+        for args in [vec!["--model".into(), "opus".into()], vec!["--permission-prompts".into(), "host".into()]] {
+            let options = BackendOptions { args, ..Default::default() };
+            assert!(adapter.check_native_options(&options).is_ok());
+        }
+    }
+
+    /// #1108: a custom subagent whose own `permissionMode` accepts edits would skip our approval
+    /// tool. A Deep build refuses it, naming the file; a `default` helper is allowed.
+    #[test]
+    fn a_permissive_custom_subagent_is_refused_before_a_deep_build() {
+        let backend =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        let config = tempfile::tempdir().unwrap();
+        let options = BackendOptions { config_dir: Some(config.path().display().to_string()), ..Default::default() };
+        for mode in ["acceptEdits", "bypassPermissions", "auto", "plan"] {
+            let project = tempfile::tempdir().unwrap();
+            let agents = project.path().join(".claude/agents");
+            std::fs::create_dir_all(&agents).unwrap();
+            std::fs::write(agents.join("helper.md"), format!("---\nname: helper\ndescription: x\npermissionMode: \"{mode}\" # checked\n---\nBody\n")).unwrap();
+            let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(project.path())).unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadSettings);
+            assert!(err.message.contains("helper.md") && err.message.contains(mode), "{}", err.message);
+        }
+        // A default helper keeps the approval path, and a body-only mention is not frontmatter.
+        let project = tempfile::tempdir().unwrap();
+        let agents = project.path().join(".claude/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("default.md"), "---\nname: default\npermissionMode: default\n---\nBody\n").unwrap();
+        std::fs::write(agents.join("example.md"), "No frontmatter.\npermissionMode: acceptEdits\n").unwrap();
+        assert!(adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(project.path())).is_ok());
+        // The frontmatter is read even when the prompt body is large, and the extension's case
+        // doesn't hide a definition.
+        let large = tempfile::tempdir().unwrap();
+        let large_agents = large.path().join(".claude/agents");
+        std::fs::create_dir_all(&large_agents).unwrap();
+        std::fs::write(large_agents.join("large.md"), format!("---\nname: large\npermissionMode: acceptEdits\n---\n{}", "x".repeat(2 * 1024 * 1024))).unwrap();
+        let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(large.path())).unwrap_err();
+        assert!(err.message.contains("large.md"), "{}", err.message);
+        let upper = tempfile::tempdir().unwrap();
+        let upper_agents = upper.path().join(".claude/agents");
+        std::fs::create_dir_all(&upper_agents).unwrap();
+        std::fs::write(upper_agents.join("upper.MD"), "---\nname: upper\npermissionMode: acceptEdits\n---\n").unwrap();
+        let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(upper.path())).unwrap_err();
+        assert!(err.message.contains("upper.MD"), "{}", err.message);
+        // The chosen config folder's own agents are checked too.
+        let user = tempfile::tempdir().unwrap();
+        let user_agents = user.path().join("agents");
+        std::fs::create_dir_all(&user_agents).unwrap();
+        std::fs::write(user_agents.join("user.md"), "---\nname: user\npermissionMode: bypassPermissions\n---\n").unwrap();
+        let user_options = BackendOptions { config_dir: Some(user.path().display().to_string()), ..Default::default() };
+        let err = adapter_for("claude-code").check_subagent_modes(&backend, &user_options, None).unwrap_err();
+        assert!(err.message.contains("user.md"), "{}", err.message);
+        // Added directories can hold their own .claude/agents outside the scanned paths.
+        for args in [vec!["--add-dir".into(), "/tmp/helpers".into()], vec!["--add-dir=/tmp/helpers".into()]] {
+            let added = BackendOptions { config_dir: options.config_dir.clone(), args, ..Default::default() };
+            let err = adapter_for("claude-code").check_subagent_modes(&backend, &added, Some(project.path())).unwrap_err();
+            assert!(err.message.contains("--add-dir"), "{}", err.message);
+        }
+        // A remote run's agents are on the other computer and aren't read here.
+        let remote = BackendConfig { ssh_host: Some("other".into()), ..backend };
+        assert!(adapter_for("claude-code").check_subagent_modes(&remote, &options, Some(project.path())).is_ok());
+    }
+
+    /// A relative config folder is resolved from the child's working folder, like Claude Code.
+    #[test]
+    fn a_relative_config_dir_is_resolved_against_the_project() {
+        let backend =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        let project = tempfile::tempdir().unwrap();
+        let agents = project.path().join("claude-config/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("helper.md"), "---\nname: helper\npermissionMode: acceptEdits\n---\n").unwrap();
+        let options = BackendOptions { config_dir: Some("claude-config".into()), ..Default::default() };
+        let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(project.path())).unwrap_err();
+        assert!(err.message.contains("helper.md"), "{}", err.message);
+    }
+
+    /// #1108: Claude Code scans `.claude/agents/` recursively and walks up to the repository root;
+    /// both discovery paths must be checked for a permissive helper.
+    #[test]
+    fn nested_and_ancestor_custom_agents_are_checked() {
+        let backend =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        let config = tempfile::tempdir().unwrap();
+        let options = BackendOptions { config_dir: Some(config.path().display().to_string()), ..Default::default() };
+        let nested = tempfile::tempdir().unwrap();
+        let nested_agents = nested.path().join(".claude/agents/review");
+        std::fs::create_dir_all(&nested_agents).unwrap();
+        std::fs::write(nested_agents.join("helper.md"), "---\nname: helper\npermissionMode: acceptEdits\n---\n").unwrap();
+        let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(nested.path())).unwrap_err();
+        assert!(err.message.contains("helper.md"), "{}", err.message);
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let ancestor_agents = repo.path().join(".claude/agents");
+        std::fs::create_dir_all(&ancestor_agents).unwrap();
+        std::fs::write(ancestor_agents.join("ancestor.md"), "---\nname: ancestor\npermissionMode: bypassPermissions\n---\n").unwrap();
+        let project = repo.path().join("sub/project");
+        std::fs::create_dir_all(&project).unwrap();
+        let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(&project)).unwrap_err();
+        assert!(err.message.contains("ancestor.md"), "{}", err.message);
+    }
+
+    /// A broken or unreadable agent file fails the check instead of being skipped.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_custom_agent_file_is_refused() {
+        use std::os::unix::fs::symlink;
+        let backend =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        let config = tempfile::tempdir().unwrap();
+        let options = BackendOptions { config_dir: Some(config.path().display().to_string()), ..Default::default() };
+        let project = tempfile::tempdir().unwrap();
+        let agents = project.path().join(".claude/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        symlink("missing", agents.join("broken.md")).unwrap();
+        let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(project.path())).unwrap_err();
+        assert!(err.message.contains("broken.md"), "{}", err.message);
+    }
+
+    /// A frontmatter that never closes inside the 64 KiB prefix must fail, not parse truncated
+    /// YAML and miss a permissive mode.
+    #[test]
+    fn an_unclosed_frontmatter_before_the_cap_is_refused() {
+        let backend =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        let config = tempfile::tempdir().unwrap();
+        let options = BackendOptions { config_dir: Some(config.path().display().to_string()), ..Default::default() };
+        let project = tempfile::tempdir().unwrap();
+        let agents = project.path().join(".claude/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let mut text = String::from("---\nname: big\npermissionMode: acceptEdits\n");
+        text.push_str(&"x".repeat(70 * 1024));
+        std::fs::write(agents.join("big.md"), text).unwrap();
+        let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(project.path())).unwrap_err();
+        assert!(err.message.contains("big.md") && err.message.contains("closing `---`"), "{}", err.message);
+    }
+
+    /// A top-level YAML merge key can carry a literal `permissionMode`; refuse it rather than
+    /// letting the nested mapping hide a permissive mode.
+    #[test]
+    fn a_top_level_yaml_merge_key_is_refused() {
+        let backend =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        let config = tempfile::tempdir().unwrap();
+        let options = BackendOptions { config_dir: Some(config.path().display().to_string()), ..Default::default() };
+        let project = tempfile::tempdir().unwrap();
+        let agents = project.path().join(".claude/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("merge.md"), "---\nname: helper\n<<:\n  permissionMode: acceptEdits\n---\n").unwrap();
+        let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(project.path())).unwrap_err();
+        assert!(err.message.contains("merge.md") && err.message.contains("merge key"), "{}", err.message);
+    }
+
+    /// Invalid YAML, aliases and over-nested frontmatter fail closed instead of being skipped.
+    #[test]
+    fn invalid_aliased_or_over_nested_frontmatter_is_refused() {
+        let backend =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        let config = tempfile::tempdir().unwrap();
+        let options = BackendOptions { config_dir: Some(config.path().display().to_string()), ..Default::default() };
+        let nested = format!("---\nx: {}1{}\n---\n", "{a: ".repeat(20), "}".repeat(20));
+        for (name, frontmatter, why) in [
+            ("nested.md", nested, "nested"),
+            ("alias.md", "---\nmode: &m acceptEdits\npermissionMode: *m\n---\n".into(), "alias"),
+            ("invalid.md", "---\npermissionMode: [unclosed\n---\n".into(), "valid YAML"),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let agents = project.path().join(".claude/agents");
+            std::fs::create_dir_all(&agents).unwrap();
+            std::fs::write(agents.join(name), frontmatter).unwrap();
+            let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(project.path())).unwrap_err();
+            assert!(err.message.contains(name) && err.message.contains(why), "{}", err.message);
+        }
+    }
+
+    /// An unquoted description with `Use when: x` may defeat YAML parsing; a column-0 permissive
+    /// mode is still found, while no mode keeps the parse error rather than allowing the file.
+    #[test]
+    fn an_unquoted_description_falls_back_to_a_lenient_permission_scan() {
+        let backend =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        let config = tempfile::tempdir().unwrap();
+        let options = BackendOptions { config_dir: Some(config.path().display().to_string()), ..Default::default() };
+        for (name, frontmatter, why) in [
+            ("no-mode.md", "---\nname: helper\ndescription: Use when: x\n---\n", "valid YAML"),
+            ("mode.md", "---\nname: helper\ndescription: Use when: x\npermissionMode: acceptEdits\n---\n", "acceptEdits"),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let agents = project.path().join(".claude/agents");
+            std::fs::create_dir_all(&agents).unwrap();
+            std::fs::write(agents.join(name), frontmatter).unwrap();
+            let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(project.path())).unwrap_err();
+            assert!(err.message.contains(name) && err.message.contains(why), "{}", err.message);
+        }
+    }
+
+    /// #1108: the frontmatter is real YAML, so quoted keys and whitespace before the colon mean
+    /// the same as the unquoted form.
+    #[test]
+    fn a_quoted_or_spaced_permission_key_is_read_as_yaml() {
+        let backend =
+            BackendConfig { name: "Claude".into(), kind: BackendKind::AgentCli, model: "claude-code".into(), base_url: None, ssh_host: None, enabled: true };
+        let config = tempfile::tempdir().unwrap();
+        let options = BackendOptions { config_dir: Some(config.path().display().to_string()), ..Default::default() };
+        for (name, mode, frontmatter) in [
+            ("quoted.md", "acceptEdits", "---\n\"permissionMode\" : acceptEdits\n---\nBody\n"),
+            ("spaced.md", "bypassPermissions", "---\npermissionMode   : bypassPermissions\n---\nBody\n"),
+            ("hyphen.md", "auto", "---\n'permission-mode' : auto\n---\nBody\n"),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let agents = project.path().join(".claude/agents");
+            std::fs::create_dir_all(&agents).unwrap();
+            std::fs::write(agents.join(name), frontmatter).unwrap();
+            let err = adapter_for("claude-code").check_subagent_modes(&backend, &options, Some(project.path())).unwrap_err();
+            assert!(err.message.contains(name) && err.message.contains(mode), "{}", err.message);
+        }
+    }
+
+    /// A remote Deep build's custom agents are on the other computer, so it leaves `Agent` out.
+    #[test]
+    fn a_remote_deep_build_leaves_helper_agents_out() {
+        let mut args = build_args(adapter_for("claude-code").as_ref(), &BackendOptions::default(), "build it", "PRE", &mcp(), None, Access::Build);
+        let pos = args.iter().position(|x| x == "--tools").unwrap();
+        assert!(args[pos + 1].split(',').any(|tool| tool == "Agent"), "a local Deep build keeps subagents");
+        adapters::without_agent_tools(&mut args);
+        assert!(!args[pos + 1].split(',').any(|tool| tool == "Agent"), "a remote Deep build leaves them out: {}", args[pos + 1]);
+        assert!(args[pos + 1].split(',').any(|tool| tool == "Bash"), "the other builder tools stay: {}", args[pos + 1]);
+        // The older name is removed too, should a later list carry it.
+        let mut both = vec!["--tools".to_string(), "Agent,Task,Bash".to_string()];
+        adapters::without_agent_tools(&mut both);
+        assert_eq!(both[1], "Bash");
+        // A saved backend's own `--tools` comes before ours; every occurrence must be stripped.
+        let mut twice = vec!["--tools".to_string(), "Agent,Read".to_string(), "--tools".to_string(), "Agent,Bash".to_string()];
+        adapters::without_agent_tools(&mut twice);
+        assert_eq!(twice, ["--tools", "Read", "--tools", "Bash"]);
+    }
+
     /// #564: in Clean room a chat's reads aren't left to Claude Code's defaults. Its own file, shell
     /// and web tools are refused outright (a deny rule beats any allow), so only our tool server,
-    /// which keeps the original out of reach, is left; Deep mode is unchanged.
+    /// which keeps the original out of reach, is left; Deep mode is unchanged. Subagents (`Agent`
+    /// and its older name `Task`) are refused too.
     #[test]
     fn a_clean_room_chat_refuses_the_agents_own_file_tools_outright() {
         let args = |access| build_args(adapter_for("claude-code").as_ref(), &BackendOptions::default(), "q", "PRE", &mcp(), None, access);
         let clean = args(Access::CleanRoomAnalyse);
         let denied = &clean[clean.iter().position(|x| x == "--disallowedTools").expect("a deny list") + 1..];
-        for t in ["Read", "Glob", "Grep", "LS", "NotebookRead", "Write", "Edit", "Bash", "PowerShell", "WebFetch", "WebSearch"] {
+        for t in ["Read", "Glob", "Grep", "LS", "NotebookRead", "Write", "Edit", "Bash", "PowerShell", "WebFetch", "WebSearch", "Task", "Agent"] {
             assert!(denied.contains(&t.to_string()), "{t} is refused: {denied:?}");
         }
         let allowed = &clean[clean.iter().position(|x| x == "--allowedTools").unwrap() + 1..clean.iter().position(|x| x == "--disallowedTools").unwrap()];
@@ -1828,10 +2152,14 @@ mod tests {
         // A Clean room question refuses reading too (it used to leave that to the default).
         let q = args(Access::CleanRoomQuestion);
         let denied = &q[q.iter().position(|x| x == "--disallowedTools").unwrap() + 1..];
-        for t in ["Read", "Glob", "Grep", "LS", "NotebookRead", "Write", "Bash"] {
+        for t in ["Read", "Glob", "Grep", "LS", "NotebookRead", "Write", "Bash", "Task", "Agent"] {
             assert!(denied.contains(&t.to_string()), "{t} is refused in a Clean room question");
         }
         assert!(!q.contains(&"--allowedTools".to_string()));
+        // A Deep question denies helpers too, so it can't hand work to a subagent.
+        let deep_q = args(Access::Question);
+        let denied = &deep_q[deep_q.iter().position(|x| x == "--disallowedTools").unwrap() + 1..];
+        assert!(denied.contains(&"Agent".to_string()) && denied.contains(&"Task".to_string()), "a Deep question can't start subagents: {denied:?}");
     }
 
     /// #564: chats take their access from the mode, as builds and questions do.
@@ -2442,7 +2770,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         // before it runs (#72), which its own tests cover.
         let aider = BackendOptions { cli_model: Some("anthropic/claude-sonnet-4".into()), ..Default::default() };
         for (agent, options) in [("gemini-cli", BackendOptions::default()), ("aider", aider), ("no-such-agent", BackendOptions::default())] {
-            assert!(check_builder_tools(adapter_for(agent).as_ref(), agent, &options, &CancelToken::default()).is_ok(), "{agent}");
+            assert!(check_builder_tools(adapter_for(agent).as_ref(), agent, &options, &CancelToken::default(), false).is_ok(), "{agent}");
         }
     }
 

@@ -821,6 +821,20 @@ Owner: open · Status: in progress
       command that breaks it. The installed skill now warns against running `setup` on such an entry;
       `doctor` and `setup` should keep the person's extra arguments instead
       — claimed: 18923837179wjt-dot, branch fix/setup-skill-warns-before-setup-drops-all-tools
+- [x] Claude Code builders can start subagents again: a local Deep build's `--tools` list includes
+      `Agent`; a custom helper with a permissive `permissionMode` is refused, and chats,
+      questions, Clean room builds and remote Deep builds leave it out (#1105)
+      — claimed: AlexJoaquimPereira, branch `bugfix/r2.2-claude-agent-subagents`; PR #1108
+- [ ] Live-check (#1105): a local Deep build's `permissionMode: default` subagent spawn gets no
+      approval call, and its file-write or command reaches `core_action_approve` and follows the
+      project's policy; a saved `Bash(git push *)` allow or a user-level subagent `PreToolUse`
+      hook that allows a refused `echo` or sandbox auto-allow is expected to bypass the tool;
+      the managed path scan is expected to refuse a managed `acceptEdits`/`plan` helper; an
+      agent file reloaded mid-turn is not re-read until the next turn (setup in
+      `claude-code.md`, not run)
+- [ ] Remote Deep builds: keep `Agent` out until a remote scan of the config and
+      `.claude/agents` paths (permissive modes, `--add-dir`, unreadable files) and its tests
+      exist; the maintainers' scope decision is requested in #1105
 
 ### R2.4 Runtime study for apps and games (with consent)
 Owner: maintainers · Status: in progress
